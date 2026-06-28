@@ -89,24 +89,41 @@ export function useVoiceConversation({
     speechBufferRef.current = `${speechBufferRef.current}${text}`
   }
 
-  const takeSpeechChunk = (force = false): string | null => {
-    const buffer = speechBufferRef.current.replace(/\s+/g, ' ').trim()
+  // Minimum length for a chunk to be voiced on its own. Shorter leading
+  // fragments — list markers like "One.", "1.", "A." — are merged with the
+  // sentence that follows, so TTS never has to speak a clipped one-word chunk
+  // (which sounds like it's "running out of air", pauses, and isn't prefetched).
+  const MIN_SPEAK_CHARS = 8
+
+  // Pure sentence splitter. Walks boundaries and accumulates until the chunk is
+  // at least MIN_SPEAK_CHARS so short markers stay attached to their text. A `.`
+  // counts as a boundary only when NOT preceded by a digit (keeps "2." and
+  // decimals like "2.0" intact); "!?。！？" always end a sentence. Returns
+  // [chunk, rest], or null when there's no usable chunk yet (and not forced).
+  const extractChunk = (raw: string, force: boolean): [string, string] | null => {
+    const buffer = raw.replace(/\s+/g, ' ').trim()
 
     if (!buffer) {
-      speechBufferRef.current = ''
-
       return null
     }
 
-    const sentence = buffer.match(/^(.+?[.!?。！？])(?:\s+|$)/)
+    const boundary = /(?:[!?。！？]|(?<![0-9])\.)(?:\s+|$)/g
+    let match: RegExpExecArray | null
+    let end = -1
 
-    if (sentence?.[1] && (sentence[1].length >= 8 || force)) {
-      const chunk = sentence[1].trim()
-      speechBufferRef.current = buffer.slice(sentence[1].length).trim()
+    while ((match = boundary.exec(buffer)) !== null) {
+      end = match.index + match[0].trimEnd().length
 
-      return chunk
+      if (end >= MIN_SPEAK_CHARS) {
+        break
+      }
     }
 
+    if (end >= 0 && (end >= MIN_SPEAK_CHARS || force)) {
+      return [buffer.slice(0, end).trim(), buffer.slice(end).trim()]
+    }
+
+    // No usable sentence boundary yet: soft-wrap a very long buffer, else wait.
     if (!force && buffer.length > 220) {
       const softBoundary = Math.max(
         buffer.lastIndexOf(', ', 180),
@@ -115,10 +132,7 @@ export function useVoiceConversation({
       )
 
       if (softBoundary > 80) {
-        const chunk = buffer.slice(0, softBoundary + 1).trim()
-        speechBufferRef.current = buffer.slice(softBoundary + 1).trim()
-
-        return chunk
+        return [buffer.slice(0, softBoundary + 1).trim(), buffer.slice(softBoundary + 1).trim()]
       }
     }
 
@@ -126,44 +140,38 @@ export function useVoiceConversation({
       return null
     }
 
-    speechBufferRef.current = ''
+    return [buffer, '']
+  }
 
-    return buffer
+  const takeSpeechChunk = (force = false): string | null => {
+    const result = extractChunk(speechBufferRef.current, force)
+
+    if (!result) {
+      return null
+    }
+
+    speechBufferRef.current = result[1]
+
+    return result[0] || null
   }
 
   // Non-mutating lookahead: returns up to *count* chunks that subsequent
   // non-forced takeSpeechChunk() calls would yield, so the loop can
-  // pre-synthesize the next sentences while the current one plays. Mirrors
-  // takeSpeechChunk's boundary rules but never returns the forced
-  // trailing-buffer fallback (that text may still be growing).
+  // pre-synthesize the next sentences while the current one plays. Uses the
+  // same splitter (force=false) so prefetched chunks match what gets spoken.
   const peekUpcomingChunks = (count: number): string[] => {
-    let buffer = speechBufferRef.current.replace(/\s+/g, ' ').trim()
+    let buffer = speechBufferRef.current
     const chunks: string[] = []
 
-    while (chunks.length < count && buffer) {
-      const sentence = buffer.match(/^(.+?[.!?。！？])(?:\s+|$)/)
+    while (chunks.length < count) {
+      const result = extractChunk(buffer, false)
 
-      if (sentence?.[1] && sentence[1].length >= 8) {
-        chunks.push(sentence[1].trim())
-        buffer = buffer.slice(sentence[1].length).trim()
-        continue
+      if (!result) {
+        break
       }
 
-      if (buffer.length > 220) {
-        const softBoundary = Math.max(
-          buffer.lastIndexOf(', ', 180),
-          buffer.lastIndexOf('; ', 180),
-          buffer.lastIndexOf(': ', 180)
-        )
-
-        if (softBoundary > 80) {
-          chunks.push(buffer.slice(0, softBoundary + 1).trim())
-          buffer = buffer.slice(softBoundary + 1).trim()
-          continue
-        }
-      }
-
-      break
+      chunks.push(result[0])
+      buffer = result[1]
     }
 
     return chunks
