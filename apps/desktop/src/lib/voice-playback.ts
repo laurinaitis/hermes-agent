@@ -58,6 +58,74 @@ export function stopVoicePlayback() {
   })
 }
 
+// Look-ahead playback cache. The voice-conversation loop calls
+// `prefetchSpeechText` for the next sentences while the current one is still
+// playing. We cache a fully *decoded* HTMLAudioElement (not just the synthesized
+// data URL) so the next chunk starts with no "preparing"/decode delay — the
+// element is buffered to `canplaythrough` ahead of time. Keyed by the sanitized
+// text (the same key `playSpeechText` looks up). Best-effort: a miss falls back
+// to synth-on-demand (prior behavior).
+const speechPrefetch = new Map<string, Promise<HTMLAudioElement | null>>()
+
+// Synthesize a sentence and buffer/decode it into a ready-to-play element.
+// Resolves once the browser reports it can play through (or on a short timeout /
+// error — `play()` will still attempt it). Returns null only if synthesis fails.
+function prepareSpeechAudio(speakableText: string): Promise<HTMLAudioElement | null> {
+  return speakText(speakableText)
+    .then(
+      response =>
+        new Promise<HTMLAudioElement | null>(resolve => {
+          const audio = new Audio()
+          audio.preload = 'auto'
+
+          let settled = false
+          const finish = () => {
+            if (settled) {
+              return
+            }
+
+            settled = true
+            audio.removeEventListener('canplaythrough', finish)
+            audio.removeEventListener('error', finish)
+            resolve(audio)
+          }
+
+          audio.addEventListener('canplaythrough', finish, { once: true })
+          audio.addEventListener('error', finish, { once: true })
+          audio.src = response.data_url
+          audio.load()
+          // Data URLs usually decode fast; don't block forever if the event is
+          // flaky for a given codec.
+          window.setTimeout(finish, 600)
+        })
+    )
+    .catch(() => null)
+}
+
+export function prefetchSpeechText(text: string): void {
+  const speakable = sanitizeTextForSpeech(text)
+
+  if (!speakable || speechPrefetch.has(speakable)) {
+    return
+  }
+
+  speechPrefetch.set(speakable, prepareSpeechAudio(speakable))
+
+  // Bound the cache so abandoned prefetches (e.g. chunk boundaries that shifted
+  // as the stream grew) can't accumulate.
+  if (speechPrefetch.size > 6) {
+    const oldest = speechPrefetch.keys().next().value
+
+    if (oldest !== undefined) {
+      speechPrefetch.delete(oldest)
+    }
+  }
+}
+
+export function clearSpeechPrefetch(): void {
+  speechPrefetch.clear()
+}
+
 export async function playSpeechText(text: string, options: VoicePlaybackOptions): Promise<boolean> {
   stopVoicePlayback()
 
@@ -73,13 +141,28 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
   setVoicePlaybackState(currentState('preparing', options))
 
   try {
-    const response = await speakText(speakableText)
+    // Use a preloaded, already-decoded element when the loop prefetched this
+    // sentence; otherwise synthesize + buffer it now.
+    let audio: HTMLAudioElement | null = null
+    const prefetched = speechPrefetch.get(speakableText)
+
+    if (prefetched) {
+      speechPrefetch.delete(speakableText)
+      audio = await prefetched
+    }
+
+    if (!audio) {
+      audio = await prepareSpeechAudio(speakableText)
+    }
+
+    if (!audio) {
+      return false
+    }
 
     if (!isCurrent()) {
       return false
     }
 
-    const audio = new Audio(response.data_url)
     currentAudio = audio
     setVoicePlaybackState(currentState('speaking', options, audio))
 

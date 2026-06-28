@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
-import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { clearSpeechPrefetch, playSpeechText, prefetchSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notify, notifyError } from '@/store/notifications'
 
 import { useMicRecorder } from './use-mic-recorder'
@@ -78,6 +78,7 @@ export function useVoiceConversation({
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
     speechBufferRef.current = ''
+    clearSpeechPrefetch()
   }
 
   const appendSpeechText = (text: string) => {
@@ -128,6 +129,44 @@ export function useVoiceConversation({
     speechBufferRef.current = ''
 
     return buffer
+  }
+
+  // Non-mutating lookahead: returns up to *count* chunks that subsequent
+  // non-forced takeSpeechChunk() calls would yield, so the loop can
+  // pre-synthesize the next sentences while the current one plays. Mirrors
+  // takeSpeechChunk's boundary rules but never returns the forced
+  // trailing-buffer fallback (that text may still be growing).
+  const peekUpcomingChunks = (count: number): string[] => {
+    let buffer = speechBufferRef.current.replace(/\s+/g, ' ').trim()
+    const chunks: string[] = []
+
+    while (chunks.length < count && buffer) {
+      const sentence = buffer.match(/^(.+?[.!?。！？])(?:\s+|$)/)
+
+      if (sentence?.[1] && sentence[1].length >= 8) {
+        chunks.push(sentence[1].trim())
+        buffer = buffer.slice(sentence[1].length).trim()
+        continue
+      }
+
+      if (buffer.length > 220) {
+        const softBoundary = Math.max(
+          buffer.lastIndexOf(', ', 180),
+          buffer.lastIndexOf('; ', 180),
+          buffer.lastIndexOf(': ', 180)
+        )
+
+        if (softBoundary > 80) {
+          chunks.push(buffer.slice(0, softBoundary + 1).trim())
+          buffer = buffer.slice(softBoundary + 1).trim()
+          continue
+        }
+      }
+
+      break
+    }
+
+    return chunks
   }
 
   const handleTurn = useCallback(
@@ -349,17 +388,30 @@ export function useVoiceConversation({
         const chunk = takeSpeechChunk(!response.pending && !busy)
 
         if (chunk) {
+          // Pre-synthesize the next couple of sentences while this one plays,
+          // so Kokoro output is queued and ready the instant the current chunk
+          // ends (gapless TTS — up to two synth requests in flight).
+          for (const upcoming of peekUpcomingChunks(2)) {
+            prefetchSpeechText(upcoming)
+          }
+
           void speak(chunk)
 
           return
         }
 
         if (!response.pending && !busy) {
+          // Whole reply spoken. Re-arm the mic NOW instead of returning and
+          // waiting for an incidental later re-render to reach startListening()
+          // at the bottom of this effect: status is already 'idle' here (the
+          // last speak() set it), so setStatus('idle') triggers no re-render —
+          // that lag was the variable 4-8s delay before recording resumed.
           awaitingSpokenResponseRef.current = false
           consumePendingResponse()
           resetSpeechBuffer()
           pendingStartRef.current = true
           setStatus('idle')
+          void startListening()
 
           return
         }
