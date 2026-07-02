@@ -3056,11 +3056,18 @@ def _session_info(agent, session: dict | None = None) -> dict:
     personality = (session or {}).get("personality", cfg_personality)
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
-    if (
-        isinstance(reasoning_config, dict)
-        and reasoning_config.get("enabled") is not False
-    ):
-        reasoning_effort = str(reasoning_config.get("effort", "") or "")
+    # Report "none" (not "") when thinking is disabled. The desktop reads an
+    # empty reasoning_effort as "use the default (medium), thinking on", so
+    # echoing "" for a disabled state makes the UI snap the Thinking toggle
+    # back to medium and drops the override on the next new chat. "none" is the
+    # value the desktop sends to disable and understands on the way back
+    # (isThinkingEnabled / normalizeEffort / reasoningEffortLabel all map it to
+    # off), so the round-trip preserves the off state.
+    if isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            reasoning_effort = "none"
+        else:
+            reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config

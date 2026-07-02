@@ -530,14 +530,64 @@ def is_routing_aggregator(provider: str) -> bool:
     return is_aggregator(provider_norm)
 
 
+_ollama_endpoint_cache: Dict[str, bool] = {}
+
+
+def _host_is_local(base_url: str) -> bool:
+    """True if base_url targets a local/private host (so we never probe cloud)."""
+    host = (base_url_hostname(base_url) or "").lower()
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}:
+        return True
+    return host.startswith("192.168.") or host.startswith("10.") or host.startswith("172.")
+
+
+def _is_ollama_endpoint(base_url: str) -> bool:
+    """True if base_url is a native Ollama server (cached, local hosts only).
+
+    Ollama's OpenAI-compatible ``/v1`` endpoint silently drops the thinking
+    switch (``think``) and request ``options`` (``num_ctx``), so we route it
+    through the native ``/api/chat`` transport instead. Detected by Ollama's
+    unique ``/api/version`` endpoint — vllm / llama.cpp / etc., which also
+    register as ``custom``, don't expose it and stay on chat_completions.
+    """
+    if not base_url:
+        return False
+    root = base_url.strip().rstrip("/")
+    if root.lower().endswith("/v1"):
+        root = root[:-3].rstrip("/")
+    if not root:
+        return False
+    cached = _ollama_endpoint_cache.get(root)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        import httpx
+
+        with httpx.Client(timeout=httpx.Timeout(3.0)) as client:
+            resp = client.get(root + "/api/version")
+            ok = resp.status_code == 200 and "version" in resp.json()
+    except Exception:
+        ok = False
+    _ollama_endpoint_cache[root] = ok
+    return ok
+
+
 def determine_api_mode(provider: str, base_url: str = "") -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
     Resolution order:
+      0. Native Ollama (local /api/version probe) → 'ollama_chat'.
       1. Known provider → transport → TRANSPORT_TO_API_MODE.
       2. URL heuristics for unknown / custom providers.
       3. Default: 'chat_completions'.
     """
+    # Native Ollama wins over the /v1 chat_completions default: only /api/chat
+    # honors `think: false`. Gated to local hosts so cloud providers (api.*)
+    # are never probed.
+    if base_url and _host_is_local(base_url) and _is_ollama_endpoint(base_url):
+        return "ollama_chat"
+
     pdef = get_provider(provider)
     if pdef is not None:
         # Even for known providers, check URL heuristics for special endpoints

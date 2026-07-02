@@ -52,6 +52,20 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from utils import base_url_host_matches, is_truthy_value
 
+
+def _ollama_native_endpoint(base_url: str) -> bool:
+    """True for a native Ollama server (local hosts only, cached probe).
+
+    Shares the gating + probe used by ``determine_api_mode`` so the fresh-agent
+    build path and the model-switch path agree on selecting ``ollama_chat``.
+    """
+    try:
+        from hermes_cli.providers import _host_is_local, _is_ollama_endpoint
+
+        return bool(base_url and _host_is_local(base_url) and _is_ollama_endpoint(base_url))
+    except Exception:
+        return False
+
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
 # ``logger = logging.getLogger(__name__)``, which resolves to "run_agent"
@@ -326,7 +340,7 @@ def init_agent(
     agent.provider = provider_name or ""
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "ollama_chat"}:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
@@ -356,6 +370,12 @@ def init_agent(
         # AWS Bedrock — auto-detect from provider name or base URL
         # (bedrock-runtime.<region>.amazonaws.com).
         agent.api_mode = "bedrock_converse"
+    elif _ollama_native_endpoint(agent.base_url):
+        # Native Ollama: /v1 silently drops `think`/`options`, so use the
+        # /api/chat transport. Reached only for custom/unknown local providers
+        # (cloud providers matched above); the probe is gated to local hosts
+        # and cached. Mirrors determine_api_mode() for the model-switch path.
+        agent.api_mode = "ollama_chat"
     else:
         agent.api_mode = "chat_completions"
 

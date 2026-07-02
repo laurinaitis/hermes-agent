@@ -423,7 +423,23 @@ class ChatCompletionsTransport(ProviderTransport):
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+                # Honor the caller's reasoning_config instead of hardcoding
+                # medium-on. Without this, "thinking off" is silently forced
+                # back to {"enabled": True, "effort": "medium"} (and any chosen
+                # effort is ignored) for unregistered OpenAI-compatible
+                # providers that reach this legacy path.
+                if (
+                    isinstance(reasoning_config, dict)
+                    and reasoning_config.get("enabled") is False
+                ):
+                    extra_body["reasoning"] = {"enabled": False}
+                else:
+                    _effort = "medium"
+                    if isinstance(reasoning_config, dict):
+                        _e = str(reasoning_config.get("effort", "") or "").strip().lower()
+                        if _e:
+                            _effort = _e
+                    extra_body["reasoning"] = {"enabled": True, "effort": _effort}
 
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)

@@ -235,6 +235,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             elif agent.api_mode == "anthropic_messages":
                 result["response"] = agent._anthropic_messages_create(api_kwargs)
+            elif agent.api_mode == "ollama_chat":
+                # Native Ollama /api/chat — speaks NDJSON, not OpenAI SSE, and
+                # honors `think: false` (which /v1 drops). The adapter returns
+                # an OpenAI-shaped object so normalization is inherited.
+                from agent.ollama_adapter import ollama_chat_create
+
+                result["response"] = ollama_chat_create(agent, api_kwargs)
             elif agent.api_mode == "bedrock_converse":
                 # Bedrock uses boto3 directly — no OpenAI client needed.
                 # normalize_converse_response produces an OpenAI-compatible
@@ -691,6 +698,20 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+        )
+
+    # ── ollama_chat (native /api/chat) ─────────────────────────────────
+    if agent.api_mode == "ollama_chat":
+        return agent._get_transport().build_kwargs(
+            model=agent.model,
+            messages=api_messages,
+            tools=tools_for_api,
+            reasoning_config=agent.reasoning_config,
+            base_url=agent.base_url,
+            temperature=getattr(agent, "temperature", None),
+            max_tokens=agent.max_tokens,
+            ollama_num_ctx=getattr(agent, "ollama_num_ctx", None),
+            request_overrides=agent.request_overrides,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -1929,7 +1950,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        if agent.api_mode == "ollama_chat":
+            # Native /api/chat streams NDJSON, not OpenAI SSE. Feed the clean
+            # native body (not stream_kwargs, which carries OpenAI-only
+            # stream_options + an httpx.Timeout that isn't JSON-serializable)
+            # to the adapter, which yields OpenAI-shaped chunks so the consumer
+            # loop below is unchanged. request_client stays unused (harmless).
+            from agent.ollama_adapter import ollama_chat_stream
+
+            stream = ollama_chat_stream(agent, api_kwargs)
+        else:
+            stream = request_client.chat.completions.create(**stream_kwargs)
 
         # Capture rate limit headers from the initial HTTP response.
         # The OpenAI SDK Stream object exposes the underlying httpx
