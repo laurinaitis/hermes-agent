@@ -48,6 +48,16 @@ DEFAULT_WEBHOOK_PORT = 8645
 DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
 MAX_TEXT_LENGTH = 4000
 
+# A wildcard bind means "every interface in this family" and is not a dialable
+# address, so a URL handed to a peer must name the loopback of the *same*
+# family the listener bound. Mapping either wildcard to the other family's
+# loopback (or to the ambiguous name "localhost", which macOS resolves to ::1
+# ahead of 127.0.0.1) points the peer at an address nothing is listening on.
+_WILDCARD_LOOPBACK = {
+    "0.0.0.0": "127.0.0.1",  # IPv4 any -> IPv4 loopback
+    "::": "::1",             # IPv6 any -> IPv6 loopback
+}
+
 # BlueBubbles/iMessage does not expose a stable bot mention identity like
 # Slack (<@U...>), Telegram (@botname), or Matrix (MXID). When users opt into
 # group mention gating without custom aliases, use conservative Hermes wake
@@ -82,6 +92,23 @@ def _redact(text: str) -> str:
     text = _PHONE_RE.sub("[REDACTED]", text)
     text = _EMAIL_RE.sub("[REDACTED]", text)
     return text
+
+
+def _connectable_host(host: str) -> str:
+    """Map a bind host to an address a peer can dial, family preserved.
+
+    A wildcard becomes the loopback of its own family. Any other host (a
+    loopback literal, ``localhost``, a LAN IP, a DNS name) is returned
+    unchanged, since it already names something the listener bound.
+    """
+    return _WILDCARD_LOOPBACK.get(host, host)
+
+
+def _url_host(host: str) -> str:
+    """Bracket a bare IPv6 literal for use in a URL netloc (RFC 3986)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +337,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     @property
     def _webhook_url(self) -> str:
-        """Compute the external webhook URL for BlueBubbles registration."""
-        host = self.webhook_host
-        if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
-            host = "localhost"
-        return f"http://{host}:{self.webhook_port}{self.webhook_path}"
+        """Compute the external webhook URL for BlueBubbles registration.
+
+        The URL must name an address in the same family the listener actually
+        bound (``web.TCPSite(self._runner, self.webhook_host, ...)``), because
+        BlueBubbles dials it from a separate process. A wildcard bind is not
+        dialable, so it resolves to the loopback *of its own family*; every
+        other host is preserved verbatim.
+        """
+        host = _connectable_host(self.webhook_host)
+        return f"http://{_url_host(host)}:{self.webhook_port}{self.webhook_path}"
 
     @property
     def _webhook_register_url(self) -> str:

@@ -1,6 +1,9 @@
 """Tests for the BlueBubbles iMessage gateway adapter."""
 import asyncio
+import ipaddress
 import json
+import socket
+from urllib.parse import urlparse
 
 import pytest
 
@@ -658,23 +661,108 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url must advertise an address the listener actually bound.
 
-    def test_default_host(self, monkeypatch):
+    BlueBubbles dials the registered URL from a separate process, so the
+    contract is family-matching: whatever family ``webhook_host`` binds, the
+    registered URL must name a dialable address in that same family.
+    """
+
+    def test_default_config_advertises_the_bound_address(self, monkeypatch):
+        """The default bind (127.0.0.1) must round-trip into the URL.
+
+        Regression for the macOS drop: collapsing the IPv4 default to the
+        ambiguous name 'localhost' sends BlueBubbles to ::1, where the
+        IPv4-only listener isn't, and every inbound POST is refused.
+        """
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
-        assert str(adapter.webhook_port) in adapter._webhook_url
-        assert adapter.webhook_path in adapter._webhook_url
+        assert adapter.webhook_host == "127.0.0.1"  # guards the premise
+        assert urlparse(adapter._webhook_url).hostname == "127.0.0.1"
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
-    def test_local_hosts_normalized(self, monkeypatch, host):
+    @pytest.mark.parametrize(
+        "host, family",
+        [
+            ("0.0.0.0", socket.AF_INET),
+            ("127.0.0.1", socket.AF_INET),
+            ("::", socket.AF_INET6),
+            ("::1", socket.AF_INET6),
+        ],
+    )
+    def test_registered_host_matches_the_bind_family(self, monkeypatch, host, family):
+        """The advertised address is dialable and in the bind's own family."""
         adapter = _make_adapter(monkeypatch, webhook_host=host)
-        assert adapter._webhook_url.startswith("http://localhost:")
+        hostname = urlparse(adapter._webhook_url).hostname
+        # Parses as an IP literal of the same family the listener bound...
+        assert socket.inet_pton(family, hostname)
+        # ...and is a concrete, dialable address (wildcards are unspecified).
+        assert not ipaddress.ip_address(hostname).is_unspecified
 
-    def test_custom_host_preserved(self, monkeypatch):
-        adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")
-        assert "192.168.1.50" in adapter._webhook_url
+    @pytest.mark.parametrize("host", ["localhost", "192.168.1.50", "gateway.internal"])
+    def test_non_wildcard_hosts_are_preserved_verbatim(self, monkeypatch, host):
+        """Only wildcards are rewritten; an explicit host is what got bound."""
+        adapter = _make_adapter(monkeypatch, webhook_host=host)
+        assert urlparse(adapter._webhook_url).hostname == host
+
+    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"])
+    def test_url_is_well_formed_for_any_bind(self, monkeypatch, host):
+        """Port and path survive, and IPv6 literals stay URL-parseable."""
+        adapter = _make_adapter(monkeypatch, webhook_host=host)
+        parsed = urlparse(adapter._webhook_url)
+        assert parsed.scheme == "http"
+        assert parsed.port == adapter.webhook_port
+        assert parsed.path == adapter.webhook_path
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"])
+    async def test_every_address_the_registered_url_resolves_to_is_listening(
+        self, monkeypatch, host
+    ):
+        """Bind the listener for real, then dial the registered URL.
+
+        BlueBubbles is a separate process: it resolves the hostname we
+        register and connects to what it gets back. Its Node client does not
+        retry the other family on ECONNREFUSED, so *every* address the
+        registered name resolves to has to be listening - it is not enough
+        that one of them is. Python's `open_connection` would paper over this
+        by falling back across addresses, so each one is dialled on its own.
+        """
+        from aiohttp import web
+
+        if "::" in host and not socket.has_ipv6:
+            pytest.skip("no IPv6 support on this host")
+
+        # A fixed port, not 0: a name that resolves to two addresses binds a
+        # socket per address, and port 0 would hand each a different ephemeral
+        # port. Production binds one port for every family.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        adapter = _make_adapter(monkeypatch, webhook_host=host, webhook_port=port)
+        app = web.Application()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, adapter.webhook_host, adapter.webhook_port)
+        try:
+            await site.start()
+            parsed = urlparse(adapter._webhook_url)
+
+            resolved = socket.getaddrinfo(
+                parsed.hostname, parsed.port, type=socket.SOCK_STREAM
+            )
+            assert resolved, f"registered host {parsed.hostname!r} resolves to nothing"
+
+            for family, _type, _proto, _canon, sockaddr in resolved:
+                _reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        sockaddr[0], sockaddr[1], family=family
+                    ),
+                    timeout=5,
+                )
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            await runner.cleanup()
 
     def test_register_url_embeds_password(self, monkeypatch):
         """_webhook_register_url should append ?password=... for inbound auth."""
