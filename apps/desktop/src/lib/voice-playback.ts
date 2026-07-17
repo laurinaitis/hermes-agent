@@ -79,6 +79,7 @@ function prepareSpeechAudio(speakableText: string): Promise<HTMLAudioElement | n
           audio.preload = 'auto'
 
           let settled = false
+
           const finish = () => {
             if (settled) {
               return
