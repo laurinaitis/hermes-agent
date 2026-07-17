@@ -68,39 +68,45 @@ export function stopVoicePlayback() {
 const speechPrefetch = new Map<string, Promise<HTMLAudioElement | null>>()
 
 // Synthesize a sentence and buffer/decode it into a ready-to-play element.
-// Resolves once the browser reports it can play through (or on a short timeout /
-// error — `play()` will still attempt it). Returns null only if synthesis fails.
-function prepareSpeechAudio(speakableText: string): Promise<HTMLAudioElement | null> {
-  return speakText(speakableText)
-    .then(
-      response =>
-        new Promise<HTMLAudioElement | null>(resolve => {
-          const audio = new Audio()
-          audio.preload = 'auto'
+// Resolves once the browser reports it can play through, or on a short timeout
+// or decode error, since `play()` will still attempt it. A synthesis failure
+// rejects so the caller still reports it the way it did before the cache.
+function prepareSpeechAudio(speakableText: string): Promise<HTMLAudioElement> {
+  return speakText(speakableText).then(
+    response =>
+      new Promise<HTMLAudioElement>(resolve => {
+        const audio = new Audio()
+        audio.preload = 'auto'
 
-          let settled = false
+        let settled = false
+        let decodeTimer: number | null = null
 
-          const finish = () => {
-            if (settled) {
-              return
-            }
-
-            settled = true
-            audio.removeEventListener('canplaythrough', finish)
-            audio.removeEventListener('error', finish)
-            resolve(audio)
+        const finish = () => {
+          if (settled) {
+            return
           }
 
-          audio.addEventListener('canplaythrough', finish, { once: true })
-          audio.addEventListener('error', finish, { once: true })
-          audio.src = response.data_url
-          audio.load()
-          // Data URLs usually decode fast; don't block forever if the event is
-          // flaky for a given codec.
-          window.setTimeout(finish, 600)
-        })
-    )
-    .catch(() => null)
+          settled = true
+
+          if (decodeTimer !== null) {
+            window.clearTimeout(decodeTimer)
+            decodeTimer = null
+          }
+
+          audio.removeEventListener('canplaythrough', finish)
+          audio.removeEventListener('error', finish)
+          resolve(audio)
+        }
+
+        audio.addEventListener('canplaythrough', finish, { once: true })
+        audio.addEventListener('error', finish, { once: true })
+        audio.src = response.data_url
+        audio.load()
+        // Data URLs usually decode fast; don't block forever if the event is
+        // flaky for a given codec.
+        decodeTimer = window.setTimeout(finish, 600)
+      })
+  )
 }
 
 export function prefetchSpeechText(text: string): void {
@@ -110,7 +116,13 @@ export function prefetchSpeechText(text: string): void {
     return
   }
 
-  speechPrefetch.set(speakable, prepareSpeechAudio(speakable))
+  // The cached promise absorbs its own rejection: a prefetch nobody consumes
+  // must not surface as an unhandled rejection, and one that failed resolves to
+  // null so the play path re-synthesizes and reports the error itself.
+  speechPrefetch.set(
+    speakable,
+    prepareSpeechAudio(speakable).catch(() => null)
+  )
 
   // Bound the cache so abandoned prefetches (e.g. chunk boundaries that shifted
   // as the stream grew) can't accumulate.
@@ -143,7 +155,8 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
   try {
     // Use a preloaded, already-decoded element when the loop prefetched this
-    // sentence; otherwise synthesize + buffer it now.
+    // sentence. A miss, or a prefetch whose synth failed, falls back to
+    // synthesizing now, and a failure there is reported as it always was.
     let audio: HTMLAudioElement | null = null
     const prefetched = speechPrefetch.get(speakableText)
 
@@ -154,10 +167,6 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
     if (!audio) {
       audio = await prepareSpeechAudio(speakableText)
-    }
-
-    if (!audio) {
-      return false
     }
 
     if (!isCurrent()) {
