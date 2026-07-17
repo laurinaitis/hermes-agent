@@ -31,18 +31,19 @@ interface VoiceConversationOptions {
 const MIN_SPEAK_CHARS = 8
 
 // Pure sentence splitter. Walks boundaries and accumulates until the chunk is
-// at least MIN_SPEAK_CHARS so short markers stay attached to their text. A `.`
-// counts as a boundary only when NOT preceded by a digit (keeps "2." and
-// decimals like "2.0" intact); "!?。！？" always end a sentence. Returns
-// [chunk, rest], or null when there's no usable chunk yet (and not forced).
-const extractChunk = (raw: string, force: boolean): [string, string] | null => {
+// at least MIN_SPEAK_CHARS, so a short marker stays attached to the text it
+// introduces. A `.` ends a sentence only when whitespace or the buffer end
+// follows, which is what keeps decimals like "2.0" whole; "!?。！？" always end
+// one. Returns [chunk, rest], or null when there is no usable chunk yet and the
+// caller isn't forcing.
+export const extractChunk = (raw: string, force: boolean): [string, string] | null => {
   const buffer = raw.replace(/\s+/g, ' ').trim()
 
   if (!buffer) {
     return null
   }
 
-  const boundary = /(?:[!?。！？]|(?<![0-9])\.)(?:\s+|$)/g
+  const boundary = /(?:[!?。！？]|\.)(?:\s+|$)/g
   let match: RegExpExecArray | null
   let end = -1
 
