@@ -234,8 +234,10 @@ export function useVoiceConversation({
   )
 
   const startListening = useCallback(async () => {
-    pendingStartRef.current = false
-
+    // Consume the pending-start flag only once the guards pass. Clearing it up
+    // front makes a call that bails (status not yet committed as 'idle', or
+    // `busy` still set) swallow the re-arm request, so the later render that
+    // *could* have started the mic finds nothing pending. Ordering from #55581.
     if (!enabledRef.current || mutedRef.current || busyRef.current) {
       return
     }
@@ -243,6 +245,8 @@ export function useVoiceConversation({
     if (statusRef.current !== 'idle') {
       return
     }
+
+    pendingStartRef.current = false
 
     try {
       // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
