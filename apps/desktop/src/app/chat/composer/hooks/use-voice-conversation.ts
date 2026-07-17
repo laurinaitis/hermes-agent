@@ -24,6 +24,60 @@ interface VoiceConversationOptions {
   consumePendingResponse: () => void
 }
 
+// Minimum length for a chunk to be voiced on its own. Shorter leading
+// fragments — list markers like "One.", "1.", "A." — are merged with the
+// sentence that follows, so TTS never has to speak a clipped one-word chunk
+// (which sounds like it's "running out of air", pauses, and isn't prefetched).
+const MIN_SPEAK_CHARS = 8
+
+// Pure sentence splitter. Walks boundaries and accumulates until the chunk is
+// at least MIN_SPEAK_CHARS so short markers stay attached to their text. A `.`
+// counts as a boundary only when NOT preceded by a digit (keeps "2." and
+// decimals like "2.0" intact); "!?。！？" always end a sentence. Returns
+// [chunk, rest], or null when there's no usable chunk yet (and not forced).
+const extractChunk = (raw: string, force: boolean): [string, string] | null => {
+  const buffer = raw.replace(/\s+/g, ' ').trim()
+
+  if (!buffer) {
+    return null
+  }
+
+  const boundary = /(?:[!?。！？]|(?<![0-9])\.)(?:\s+|$)/g
+  let match: RegExpExecArray | null
+  let end = -1
+
+  while ((match = boundary.exec(buffer)) !== null) {
+    end = match.index + match[0].trimEnd().length
+
+    if (end >= MIN_SPEAK_CHARS) {
+      break
+    }
+  }
+
+  if (end >= 0 && (end >= MIN_SPEAK_CHARS || force)) {
+    return [buffer.slice(0, end).trim(), buffer.slice(end).trim()]
+  }
+
+  // No usable sentence boundary yet: soft-wrap a very long buffer, else wait.
+  if (!force && buffer.length > 220) {
+    const softBoundary = Math.max(
+      buffer.lastIndexOf(', ', 180),
+      buffer.lastIndexOf('; ', 180),
+      buffer.lastIndexOf(': ', 180)
+    )
+
+    if (softBoundary > 80) {
+      return [buffer.slice(0, softBoundary + 1).trim(), buffer.slice(softBoundary + 1).trim()]
+    }
+  }
+
+  if (!force) {
+    return null
+  }
+
+  return [buffer, '']
+}
+
 export function useVoiceConversation({
   busy,
   enabled,
@@ -87,60 +141,6 @@ export function useVoiceConversation({
     }
 
     speechBufferRef.current = `${speechBufferRef.current}${text}`
-  }
-
-  // Minimum length for a chunk to be voiced on its own. Shorter leading
-  // fragments — list markers like "One.", "1.", "A." — are merged with the
-  // sentence that follows, so TTS never has to speak a clipped one-word chunk
-  // (which sounds like it's "running out of air", pauses, and isn't prefetched).
-  const MIN_SPEAK_CHARS = 8
-
-  // Pure sentence splitter. Walks boundaries and accumulates until the chunk is
-  // at least MIN_SPEAK_CHARS so short markers stay attached to their text. A `.`
-  // counts as a boundary only when NOT preceded by a digit (keeps "2." and
-  // decimals like "2.0" intact); "!?。！？" always end a sentence. Returns
-  // [chunk, rest], or null when there's no usable chunk yet (and not forced).
-  const extractChunk = (raw: string, force: boolean): [string, string] | null => {
-    const buffer = raw.replace(/\s+/g, ' ').trim()
-
-    if (!buffer) {
-      return null
-    }
-
-    const boundary = /(?:[!?。！？]|(?<![0-9])\.)(?:\s+|$)/g
-    let match: RegExpExecArray | null
-    let end = -1
-
-    while ((match = boundary.exec(buffer)) !== null) {
-      end = match.index + match[0].trimEnd().length
-
-      if (end >= MIN_SPEAK_CHARS) {
-        break
-      }
-    }
-
-    if (end >= 0 && (end >= MIN_SPEAK_CHARS || force)) {
-      return [buffer.slice(0, end).trim(), buffer.slice(end).trim()]
-    }
-
-    // No usable sentence boundary yet: soft-wrap a very long buffer, else wait.
-    if (!force && buffer.length > 220) {
-      const softBoundary = Math.max(
-        buffer.lastIndexOf(', ', 180),
-        buffer.lastIndexOf('; ', 180),
-        buffer.lastIndexOf(': ', 180)
-      )
-
-      if (softBoundary > 80) {
-        return [buffer.slice(0, softBoundary + 1).trim(), buffer.slice(softBoundary + 1).trim()]
-      }
-    }
-
-    if (!force) {
-      return null
-    }
-
-    return [buffer, '']
   }
 
   const takeSpeechChunk = (force = false): string | null => {
