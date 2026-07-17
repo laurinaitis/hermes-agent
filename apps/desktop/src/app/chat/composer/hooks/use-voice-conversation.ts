@@ -32,10 +32,15 @@ const MIN_SPEAK_CHARS = 8
 
 // Pure sentence splitter. Walks boundaries and accumulates until the chunk is
 // at least MIN_SPEAK_CHARS, so a short marker stays attached to the text it
-// introduces. A `.` ends a sentence only when whitespace or the buffer end
-// follows, which is what keeps decimals like "2.0" whole; "!?。！？" always end
-// one. Returns [chunk, rest], or null when there is no usable chunk yet and the
-// caller isn't forcing.
+// introduces. Returns [chunk, rest], or null when there is no usable chunk yet
+// and the caller isn't forcing.
+//
+// `!?。！？` end a sentence. A `.` does too, but the buffer here is still
+// growing, so its end proves nothing: `1.` may be a finished sentence or the
+// head of `1.2`. A `.` after a digit therefore waits for whitespace to confirm
+// it, while every other `.` may also end at the buffer end. That costs one
+// character of latency on "grew 12." and keeps "1.2 billion" from being spoken
+// as "one" then "two billion".
 export const extractChunk = (raw: string, force: boolean): [string, string] | null => {
   const buffer = raw.replace(/\s+/g, ' ').trim()
 
@@ -43,7 +48,7 @@ export const extractChunk = (raw: string, force: boolean): [string, string] | nu
     return null
   }
 
-  const boundary = /(?:[!?。！？]|\.)(?:\s+|$)/g
+  const boundary = /(?:[!?。！？](?:\s+|$)|(?<![0-9])\.(?:\s+|$)|(?<=[0-9])\.\s+)/g
   let match: RegExpExecArray | null
   let end = -1
 
