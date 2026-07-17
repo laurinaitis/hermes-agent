@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 type BrowserAudioContext = typeof AudioContext
 
@@ -80,48 +80,48 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const silenceStartedAtRef = useRef<number | null>(null)
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
 
-  const stopMeter = () => {
+  const stopMeter = useCallback(() => {
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
       animationRef.current = null
     }
 
     setLevel(0)
-  }
+  }, [])
 
   // Tear down the per-turn audio graph (meter loop, analyser, AudioContext).
   // The AudioContext is intentionally NOT kept alive between turns: the browser
   // can suspend an idle context, after which the analyser reads silence and
   // speech detection silently stops (the turn then idles out after ~12s). It's
   // cheap to recreate, so we rebuild it fresh on every re-arm.
-  const teardownAudioGraph = () => {
+  const teardownAudioGraph = useCallback(() => {
     stopMeter()
     sourceRef.current?.disconnect()
     sourceRef.current = null
     analyserRef.current = null
     void audioContextRef.current?.close()
     audioContextRef.current = null
-  }
+  }, [stopMeter])
 
   // Soft stop between turns: drop the per-turn MediaRecorder + audio graph but
   // KEEP the mic STREAM alive, so the next turn re-arms without a fresh
   // getUserMedia (that round-trip was the multi-second post-TTS mic delay).
-  const softCleanup = () => {
+  const softCleanup = useCallback(() => {
     teardownAudioGraph()
     recorderRef.current = null
     setRecording(false)
     silenceTriggeredRef.current = false
-  }
+  }, [teardownAudioGraph])
 
   // Full release: also stop the mic tracks. Used when the conversation
   // ends/cancels, on a recorder error, or on unmount.
-  const releaseStream = () => {
+  const releaseStream = useCallback(() => {
     softCleanup()
     streamRef.current?.getTracks().forEach(track => track.stop())
     streamRef.current = null
-  }
+  }, [softCleanup])
 
-  useEffect(() => () => releaseStream(), [])
+  useEffect(() => () => releaseStream(), [releaseStream])
 
   const startMeter = (stream: MediaStream, options: MicRecorderOptions) => {
     const audioWindow = window as Window & { webkitAudioContext?: BrowserAudioContext }
